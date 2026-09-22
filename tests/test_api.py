@@ -4482,3 +4482,448 @@ def test_legacy_database_supports_subject_replacement_after_migration(
         ).json()
         assert len(events["replacements"]) == 1
         assert_no_sequence_leak(events)
+
+
+# ---------- 模板克隆 POST /experiments/{id}/clone ----------
+
+def clone_experiment(
+    client: TestClient,
+    source_id: str,
+    subject_ids: list[str],
+    seed: int,
+    washout_seconds: int | None = None,
+):
+    payload: dict = {"subject_ids": subject_ids, "seed": seed}
+    if washout_seconds is not None:
+        payload["washout_seconds"] = washout_seconds
+    return client.post(f"/experiments/{source_id}/clone", json=payload)
+
+
+def test_clone_creates_independent_experiment_with_roster_only(
+    client: TestClient,
+) -> None:
+    source, source_subjects = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"s{i}" for i in range(6)],
+        seed=42,
+        washout_seconds=900,
+    )
+    source_id = source["experiment_id"]
+
+    clone_subjects = [f"c{i}" for i in range(6)]
+    resp = clone_experiment(client, source_id, clone_subjects, seed=77)
+    assert resp.status_code == 201, resp.text
+    clone = resp.json()
+
+    # 独立实验：新 ID，只返回名册
+    assert clone["experiment_id"] != source_id
+    assert clone["conditions"] == ["A", "B", "C"]
+    assert clone["seed"] == 77
+    assert clone["group_size"] == 6
+    assert clone["num_subjects"] == 6
+    assert clone["num_periods"] == 3
+    assert clone["washout_seconds"] == 900  # 省略 washout 时沿用源实验
+    # 克隆始终是全新的运行中实验，状态版本从 0 开始
+    assert clone["status"] == "active"
+    assert clone["state_version"] == 0
+    assert [a["subject_id"] for a in clone["assignments"]] == clone_subjects
+    assert set(clone["assignments"][0].keys()) == {"subject_id"}
+    assert_no_sequence_leak(clone)
+
+    # 详情接口与列表都能看到新实验，且两个实验相互独立
+    assert (
+        client.get(f"/experiments/{clone['experiment_id']}").json() == clone
+    )
+    listing_ids = {e["experiment_id"] for e in client.get("/experiments").json()}
+    assert {source_id, clone["experiment_id"]} <= listing_ids
+
+
+def test_clone_regenerates_balanced_williams_assignment(
+    client: TestClient,
+) -> None:
+    # 源实验为偶数条件（组大小 4）
+    source, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C", "D"],
+        subject_ids=[f"s{i}" for i in range(8)],
+        seed=3,
+    )
+    clone_subjects = [f"c{i}" for i in range(8)]
+    resp = clone_experiment(client, source["experiment_id"], clone_subjects, seed=99)
+    assert resp.status_code == 201, resp.text
+    clone = resp.json()
+
+    # 逐周期揭盲重建克隆实验的全部序列：仍满足 Williams 平衡
+    sequences = [
+        reveal_sequence(client, clone["experiment_id"], s, 4)
+        for s in clone_subjects
+    ]
+    assert_balanced(sequences, 4)
+
+
+def test_clone_assignment_is_deterministic_from_new_seed(
+    client: TestClient,
+) -> None:
+    source, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"s{i}" for i in range(6)],
+        seed=42,
+    )
+    clone_subjects = [f"c{i}" for i in range(6)]
+
+    cloned = clone_experiment(
+        client, source["experiment_id"], clone_subjects, seed=123
+    ).json()
+    # 相同条件 + 相同受试者 + 相同种子，无论创建还是克隆，分配完全一致
+    direct = client.post(
+        "/experiments",
+        json={
+            "conditions": source["conditions"],
+            "subject_ids": clone_subjects,
+            "seed": 123,
+        },
+    ).json()
+
+    clone_seqs = [
+        reveal_sequence(client, cloned["experiment_id"], s, 3, "clone-")
+        for s in clone_subjects
+    ]
+    direct_seqs = [
+        reveal_sequence(client, direct["experiment_id"], s, 3, "direct-")
+        for s in clone_subjects
+    ]
+    assert clone_seqs == direct_seqs
+
+    # 换种子后分配可以不同（源实验的分配不被复制）
+    other = clone_experiment(
+        client, source["experiment_id"], [f"o{i}" for i in range(6)], seed=456
+    ).json()
+    other_seqs = [
+        reveal_sequence(client, other["experiment_id"], s, 3, "other-")
+        for s in [f"o{i}" for i in range(6)]
+    ]
+    source_seqs = [
+        reveal_sequence(client, source["experiment_id"], f"s{i}", 3, "src-")
+        for i in range(6)
+    ]
+    # 不同受试者名册的两个独立实验之间不强制差异，但新种子下序列池重洗，
+    # 且克隆实验自身必须是完整平衡组
+    assert_balanced(other_seqs, 3)
+    assert_balanced(source_seqs, 3)
+
+
+def test_clone_regenerates_slots_nonces_and_per_period_commitments(
+    client: TestClient,
+) -> None:
+    source, _ = create_experiment(
+        client,
+        conditions=["条件甲", "条件乙"],
+        subject_ids=["源一", "源二"],
+        seed=5,
+    )
+    source_id = source["experiment_id"]
+    source_commitments = client.get(
+        f"/experiments/{source_id}/commitments"
+    ).json()["commitments"]
+
+    clone_subjects = ["新一", "新二"]
+    clone = clone_experiment(
+        client, source_id, clone_subjects, seed=6
+    ).json()
+    clone_id = clone["experiment_id"]
+    assert clone_id != source_id
+    clone_commitments = client.get(
+        f"/experiments/{clone_id}/commitments"
+    ).json()["commitments"]
+
+    # 稳定槽位与每周期承诺全部重新生成，与源实验没有任何复用
+    source_slots = {item["allocation_slot_id"] for item in source_commitments}
+    clone_slots = {item["allocation_slot_id"] for item in clone_commitments}
+    assert source_slots.isdisjoint(clone_slots)
+    source_digests = {item["commitment"] for item in source_commitments}
+    clone_digests = {item["commitment"] for item in clone_commitments}
+    assert source_digests.isdisjoint(clone_digests)
+
+    by_key = {
+        (item["subject_id"], item["period"]): item
+        for item in clone_commitments
+    }
+    # 克隆实验揭盲返回的新 nonce 必须能按“新实验 ID + 新槽位”核验承诺
+    revealed = client.post(
+        f"/experiments/{clone_id}/advance",
+        json={
+            "subject_id": "新一",
+            "expected_period": 1,
+            "request_id": "clone-reveal-1",
+        },
+    )
+    assert revealed.status_code == 200
+    body = revealed.json()
+    assert body["allocation_slot_id"] == by_key[("新一", 1)]["allocation_slot_id"]
+    assert (
+        commitment_digest(
+            clone_id,
+            body["allocation_slot_id"],
+            1,
+            body["condition"],
+            body["nonce"],
+        )
+        == by_key[("新一", 1)]["commitment"]
+    )
+    # 同一份 nonce / 槽位不可能通过源实验 ID 核验：材料确实各自独立
+    assert (
+        commitment_digest(
+            source_id,
+            body["allocation_slot_id"],
+            1,
+            body["condition"],
+            body["nonce"],
+        )
+        != by_key[("新一", 1)]["commitment"]
+    )
+    assert re.fullmatch(r"[0-9a-f]{32}", body["nonce"])
+    assert body["nonce"] not in {
+        item["commitment"] for item in source_commitments
+    }
+
+
+def test_clone_does_not_carry_unblinding_or_emergency_progress(
+    client: TestClient,
+) -> None:
+    source, source_subjects = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=8
+    )
+    source_id = source["experiment_id"]
+
+    # 源实验积累多种进度：按周期揭盲、完成登记、紧急揭盲审计
+    first = reveal_period(client, source_id, "s1", 1, "src-")
+    assert first.status_code == 200
+    assert complete_period(client, source_id, "s1", 1, "src-c1").status_code == 200
+    emergency = client.post(
+        f"/experiments/{source_id}/emergency-unblind",
+        json={
+            "subject_id": "s2",
+            "approver_id": "alice",
+            "operation_id": "emu-1",
+            "reason": "SAE",
+        },
+    )
+    assert emergency.status_code == 200
+
+    clone_subjects = ["c1", "c2"]
+    clone = clone_experiment(client, source_id, clone_subjects, seed=8).json()
+    clone_id = clone["experiment_id"]
+
+    # 克隆实验没有任何揭盲 / 完成 / 紧急揭盲痕迹
+    for subject_id in clone_subjects:
+        progress = client.get(
+            f"/experiments/{clone_id}/subjects/{subject_id}/progress"
+        ).json()
+        assert progress["next_period"] == 1
+        assert progress["completed"] is False
+        assert progress["reveals"] == []
+        assert progress["next_available_at"] is None
+    assert (
+        client.get(f"/experiments/{clone_id}/emergency-unblind-events").json()[
+            "events"
+        ]
+        == []
+    )
+    assert (
+        client.get(f"/experiments/{clone_id}/state-events").json()["events"]
+        == []
+    )
+
+    # 克隆第一人可直接揭盲周期 1（若进度被复制，会是 period_mismatch）
+    fresh = client.post(
+        f"/experiments/{clone_id}/advance",
+        json={
+            "subject_id": "c1",
+            "expected_period": 1,
+            "request_id": "clone-r1",
+        },
+    )
+    assert fresh.status_code == 200
+
+    # 源实验进度保持原样，克隆揭盲不回写到源实验
+    source_progress = client.get(
+        f"/experiments/{source_id}/subjects/s1/progress"
+    ).json()
+    assert source_progress["next_period"] == 2
+    assert len(source_progress["reveals"]) == 1
+    source_events = client.get(
+        f"/experiments/{source_id}/emergency-unblind-events"
+    ).json()["events"]
+    assert [e["action"] for e in source_events] == ["window_opened"]
+
+
+def test_clone_inherits_washout_and_can_override(client: TestClient) -> None:
+    source, _ = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["s1", "s2"],
+        seed=1,
+        washout_seconds=3600,
+    )
+
+    # 省略 washout_seconds：沿用源实验的洗脱期
+    inherited = clone_experiment(
+        client, source["experiment_id"], ["c1", "c2"], seed=2
+    ).json()
+    assert inherited["washout_seconds"] == 3600
+    assert client.post(
+        f"/experiments/{inherited['experiment_id']}/advance",
+        json={"subject_id": "c1", "expected_period": 1, "request_id": "i1"},
+    ).status_code == 200
+    assert complete_period(
+        client, inherited["experiment_id"], "c1", 1, "ic1"
+    ).status_code == 200
+    blocked = client.post(
+        f"/experiments/{inherited['experiment_id']}/advance",
+        json={"subject_id": "c1", "expected_period": 2, "request_id": "i2"},
+    )
+    assert blocked.status_code == 409
+    detail = blocked.json()["detail"]
+    assert detail["reason"] == "washout_not_elapsed"
+    assert 1 <= detail["retry_after_seconds"] <= 3600
+
+    # 显式覆盖 washout_seconds=0：完成即可推进
+    overridden = clone_experiment(
+        client, source["experiment_id"], ["d1", "d2"], seed=3, washout_seconds=0
+    ).json()
+    assert overridden["washout_seconds"] == 0
+    assert client.post(
+        f"/experiments/{overridden['experiment_id']}/advance",
+        json={"subject_id": "d1", "expected_period": 1, "request_id": "o1"},
+    ).status_code == 200
+    assert complete_period(
+        client, overridden["experiment_id"], "d1", 1, "oc1"
+    ).status_code == 200
+    ok = client.post(
+        f"/experiments/{overridden['experiment_id']}/advance",
+        json={"subject_id": "d1", "expected_period": 2, "request_id": "o2"},
+    )
+    assert ok.status_code == 200
+
+
+def test_clone_of_paused_source_starts_active_and_unblinds(
+    client: TestClient,
+) -> None:
+    source, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    source_id = source["experiment_id"]
+    assert pause_experiment(client, source_id, "hold-clone").status_code == 200
+
+    clone = clone_experiment(client, source_id, ["c1", "c2"], seed=2).json()
+    assert clone["status"] == "active"
+    assert clone["state_version"] == 0
+
+    # 克隆不受源实验暂停影响，可正常揭盲；源实验仍暂停
+    assert client.post(
+        f"/experiments/{clone['experiment_id']}/advance",
+        json={"subject_id": "c1", "expected_period": 1, "request_id": "cr1"},
+    ).status_code == 200
+    source_advance = client.post(
+        f"/experiments/{source_id}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "sr1"},
+    )
+    assert source_advance.status_code == 409
+    assert source_advance.json()["detail"]["reason"] == "experiment_paused"
+
+
+def test_clone_subject_count_not_complete_group_returns_422(
+    client: TestClient,
+) -> None:
+    # 奇数条件：完整组大小为 6
+    source, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"s{i}" for i in range(6)],
+        seed=1,
+    )
+
+    resp = clone_experiment(
+        client, source["experiment_id"], [f"c{i}" for i in range(7)], seed=1
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["subject_count"] == 7
+    assert detail["group_size"] == 6
+    assert detail["nearest_acceptable"] == [6, 12]
+
+    # 不足一组
+    resp = clone_experiment(client, source["experiment_id"], ["c1"], seed=1)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["nearest_acceptable"] == [6]
+
+    # 偶数条件源实验：组大小为 4，可接受数量按源条件重新计算
+    even, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C", "D"],
+        subject_ids=[f"t{i}" for i in range(4)],
+        seed=1,
+    )
+    resp = clone_experiment(
+        client, even["experiment_id"], ["c1", "c2", "c3"], seed=1
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["group_size"] == 4
+    assert resp.json()["detail"]["nearest_acceptable"] == [4]
+
+    # 失败不创建实验
+    assert len(client.get("/experiments").json()) == 2
+
+
+def test_clone_rejects_duplicate_or_empty_subjects(client: TestClient) -> None:
+    source, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    source_id = source["experiment_id"]
+
+    dup = clone_experiment(client, source_id, ["c1", "c1"], seed=1)
+    assert dup.status_code == 422
+    blank = clone_experiment(client, source_id, ["c1", "  "], seed=1)
+    assert blank.status_code == 422
+    negative_washout = clone_experiment(
+        client, source_id, ["c1", "c2"], seed=1, washout_seconds=-1
+    )
+    assert negative_washout.status_code == 422
+
+    # 校验失败不创建实验
+    assert len(client.get("/experiments").json()) == 1
+
+
+def test_clone_unknown_source_returns_404(client: TestClient) -> None:
+    resp = clone_experiment(
+        client, "missing-experiment", ["c1", "c2"], seed=1
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "experiment not found"
+
+
+def test_clone_allows_multiple_complete_groups(client: TestClient) -> None:
+    source, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"s{i}" for i in range(6)],
+        seed=1,
+    )
+    # 克隆可以使用与源实验不同的受试者数量，只要是完整组的整数倍
+    resp = clone_experiment(
+        client, source["experiment_id"], [f"c{i}" for i in range(12)], seed=1
+    )
+    assert resp.status_code == 201, resp.text
+    clone = resp.json()
+    assert clone["num_subjects"] == 12
+    sequences = [
+        reveal_sequence(client, clone["experiment_id"], f"c{i}", 3, "g-")
+        for i in range(12)
+    ]
+    # 2 个完整组：Williams 平衡成立
+    assert_balanced(sequences, 3)
+    assert sorted(Counter(tuple(seq) for seq in sequences).values()) == [
+        2, 2, 2, 2, 2, 2
+    ]

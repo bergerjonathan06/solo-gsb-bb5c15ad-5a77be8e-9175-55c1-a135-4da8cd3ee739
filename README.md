@@ -311,6 +311,69 @@ curl -X POST http://localhost:8000/experiments \
 }
 ```
 
+### 模板克隆 `POST /experiments/{experiment_id}/clone`
+
+在不触碰源实验的前提下，基于源实验的**条件集合**创建一个完全独立的新实验，
+适用于同一方案的多批次 / 多中心复制：
+
+```bash
+curl -X POST http://localhost:8000/experiments/<source_experiment_id>/clone \
+  -H 'Content-Type: application/json' \
+  -d '{"subject_ids": ["c1", "c2", "c3", "c4", "c5", "c6"], "seed": 99}'
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `subject_ids` | 新实验的互异受试者 ID；数量必须是源条件对应完整组大小的整数倍 |
+| `seed` | 新实验随机种子（整数），相同条件 / 受试者 / 种子产生相同分配 |
+| `washout_seconds`（可选） | 新实验洗脱期秒数，非负整数；**省略时沿用源实验的 `washout_seconds`** |
+
+克隆只继承源实验的**条件**与（默认的）洗脱期，其余一切全部重新生成：
+
+- **新的 Williams 分配**：用新 `seed` 重新打乱序列池并映射给新受试者，
+  不复制源实验任何人的序列或序列下标；相同条件 / 受试者 / 种子的克隆结果
+  与直接调用 `POST /experiments` 创建完全一致（确定性）；
+- **新的稳定槽位与盲态承诺**：每个槽位 / 周期重新生成 128 位随机 `nonce`
+  与 SHA-256 承诺，且承诺以**新实验 ID + 新槽位**计算，因此与源实验的
+  `allocation_slot_id` / `nonce` / `commitment` 两两不相交，揭盲返回的
+  nonce 只能在新实验的承诺列表中核验；
+- **零进度继承**：新实验从 `active` / `state_version=0` 起步，不携带源实验的
+  任何揭盲记录、完成登记、`subject_progress`、暂停状态、状态 / 紧急揭盲审计、
+  快照、换号墓碑或幂等结果；源实验随后的揭盲 / 暂停也不影响克隆，反之亦然。
+
+成功返回 `201`，响应结构与创建接口完全相同——**只有新实验名册**，不含任何
+条件序列：
+
+```json
+{
+  "experiment_id": "…（不同于源实验）",
+  "conditions": ["A", "B", "C"],
+  "seed": 99,
+  "group_size": 6,
+  "num_subjects": 6,
+  "num_periods": 3,
+  "washout_seconds": 86400,
+  "status": "active",
+  "state_version": 0,
+  "created_at": "…",
+  "assignments": [
+    {"subject_id": "c1"},
+    {"subject_id": "c2"}
+  ]
+}
+```
+
+错误：
+
+- 源实验不存在返回 `404`；
+- 受试者数量不能按源条件整分为完整序列组时返回 `422`（结构同创建接口，
+  回传 `group_size` / `subject_count` / `nearest_acceptable`），允许使用
+  与源实验不同但成整组的数量（如 3 条件源实验可克隆 6 或 12 人）；
+- `subject_ids` 为空字符串或存在重复、`washout_seconds` 为负均返回 `422`。
+
+即使源实验已暂停、已部分揭盲或已完成紧急揭盲，也可以克隆；克隆总是一个
+全新的运行中实验。
+
 ### 查询盲态承诺 `GET /experiments/{experiment_id}/commitments`
 
 ```bash
@@ -940,9 +1003,25 @@ curl 'http://localhost:8000/experiments/<experiment_id>/subject-replacements?lim
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、受试者换号、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、受试者换号、模板克隆、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
+
+### Docker 回归测试
+
+无需在宿主机安装 Python，直接用 compose 构建出的镜像运行整套 pytest
+（克隆回归用例见 `tests/test_api.py` 中 `clone` 一节）：
+
+```bash
+# 完整回归（构建镜像 -> 容器内安装 dev 依赖 -> 运行全部测试）
+./scripts/docker-regression-tests.sh
+
+# 只跑模板克隆相关用例
+TEST_ARGS="-k clone" ./scripts/docker-regression-tests.sh
+```
+
+脚本将源码与测试只读挂载进镜像构建出的容器，`DATABASE_PATH` 指向容器内
+临时文件，容器退出即清除，不污染 `crossover-data` 数据卷。
 
 ## 实现要点
 
@@ -950,7 +1029,15 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   其余行循环移位（模 n）；奇数阶再拼接镜像方阵，使每个有向相邻对出现次数相等。
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
-  序列只写入服务端存储，不进入创建 / 详情响应。
+  序列只写入服务端存储，不进入创建 / 详情响应。创建与克隆共用同一套校验与
+  分配构造（`_create_experiment_record`），保证两条路径行为一致。
+- **模板克隆的独立性**（`POST /experiments/{id}/clone`）：克隆只读取源实验的
+  条件集合与（默认继承的）洗脱期，随后走与创建完全相同的落库路径——新 UUID、
+  新种子重洗 Williams 序列池、新稳定槽位（UUID）与每槽位 / 周期新随机
+  nonce 及承诺（承诺以新实验 ID 参与哈希）。克隆不复制 `assignments` 之外的
+  任何表：揭盲、完成、进度、暂停 / 状态版本、紧急揭盲会话与审计、快照、
+  换号墓碑以及各类幂等记录一律不带入，新实验恒为 `active` / 版本 0；
+  因此即使源实验已暂停或全部揭盲，克隆也不受影响，源实验同样不受克隆影响。
 - **存储**（`app/db.py`，SQLite）共十四张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；

@@ -27,6 +27,28 @@ class ExperimentCreate(BaseModel):
     )
 
 
+class ExperimentClone(BaseModel):
+    """基于源实验条件克隆新实验的请求体。
+
+    新实验复用源实验的条件集合，但受试者、种子与洗脱期均独立给出；
+    Williams 分配、稳定槽位与盲态承诺全部重新生成，不携带源实验的
+    任何揭盲进度、nonce 或 commitment。
+    """
+
+    subject_ids: list[str] = Field(
+        ..., min_length=1, description="新实验的互异受试者 ID（与源实验相互独立）"
+    )
+    seed: int = Field(..., description="新实验随机种子，相同输入与种子产生相同分配")
+    washout_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "新实验相邻周期间的洗脱期秒数（非负）；省略时沿用源实验的"
+            "washout_seconds"
+        ),
+    )
+
+
 class AssignmentOut(BaseModel):
     """受试者名册条目；不含条件序列，避免提前揭盲。"""
 

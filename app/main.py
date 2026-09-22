@@ -16,6 +16,10 @@
 另提供受试者换号：仅允许原受试者从未揭盲时，在单个写事务内把隐藏分配
 （序列内容与下标不变）与进度原子转移到新编号，原编号保留墓碑不可复用、
 不可查询或推进，并追加不含条件内容的换号审计（按时间倒序分页查询）。
+另提供模板克隆：POST /experiments/{experiment_id}/clone 基于源实验的
+条件集合与（可覆盖的）洗脱期，用全新互异 subject_ids 与 seed 创建独立
+实验；克隆重新生成 Williams 分配、稳定槽位及每周期 nonce / 盲态承诺，
+绝不复用源实验的 nonce / commitment，也不携带任何揭盲进度或状态。
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from .schemas import (
     EmergencyUnblindEventsOut,
     EmergencyUnblindOut,
     EmergencyUnblindRequest,
+    ExperimentClone,
     ExperimentCreate,
     ExperimentOut,
     ExperimentSummary,
@@ -68,7 +73,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -98,16 +103,8 @@ def _state_conflict_detail(exc: db.InvalidStateTransitionError) -> dict:
     return detail
 
 
-@app.post(
-    "/experiments",
-    status_code=201,
-    response_model=ExperimentOut,
-    summary="创建实验并生成分配结果（不返回条件序列）",
-)
-def create_experiment(payload: ExperimentCreate) -> dict:
-    conditions = payload.conditions
-    subject_ids = payload.subject_ids
-
+def _validate_conditions(conditions: list[str]) -> None:
+    """校验条件列表：每项非空且整体互异，否则 422。"""
     if any(not c.strip() for c in conditions):
         raise HTTPException(
             status_code=422, detail="conditions 不能为空字符串"
@@ -116,6 +113,10 @@ def create_experiment(payload: ExperimentCreate) -> dict:
         raise HTTPException(
             status_code=422, detail="conditions 必须互异（存在重复条件）"
         )
+
+
+def _validate_subject_ids(subject_ids: list[str]) -> None:
+    """校验受试者列表：每项非空且整体互异，否则 422。"""
     if any(not s.strip() for s in subject_ids):
         raise HTTPException(
             status_code=422, detail="subject_ids 不能为空字符串"
@@ -125,10 +126,9 @@ def create_experiment(payload: ExperimentCreate) -> dict:
             status_code=422, detail="subject_ids 必须互异（存在重复受试者）"
         )
 
-    n = len(conditions)
-    size = group_size(n)
-    count = len(subject_ids)
 
+def _ensure_complete_groups(count: int, size: int) -> None:
+    """受试者数量必须能整分为完整 Williams 序列组，否则 422。"""
     if count % size != 0:
         lower = (count // size) * size
         upper = lower + size
@@ -146,16 +146,26 @@ def create_experiment(payload: ExperimentCreate) -> dict:
             },
         )
 
-    # Williams 平衡序列（下标形式），再映射为实际条件。
-    # 完整序列写入服务端存储，不在响应中返回。
+
+def _build_assignments(
+    conditions: list[str], subject_ids: list[str], seed: int
+) -> tuple[int, list[dict]]:
+    """按 Williams 平衡序列与种子构造受试者分配（含完整条件序列）。
+
+    用种子确定性地打乱“序列池”，再依次分配给受试者。池中每条序列恰好
+    出现 ``count // size`` 次，保证整组完整。完整序列只供写入服务端
+    存储，不进入任何响应。
+    """
+    n = len(conditions)
+    size = group_size(n)
+    count = len(subject_ids)
+
     index_sequences = williams_sequences(n)
     condition_sequences = [
         [conditions[i] for i in seq] for seq in index_sequences
     ]
 
-    # 用种子确定性地打乱“序列池”，再依次分配给受试者。
-    # 池中每条序列恰好出现 count // size 次，保证整组完整。
-    rng = random.Random(payload.seed)
+    rng = random.Random(seed)
     pool = list(range(size)) * (count // size)
     rng.shuffle(pool)
 
@@ -167,32 +177,99 @@ def create_experiment(payload: ExperimentCreate) -> dict:
         }
         for i, subject_id in enumerate(subject_ids)
     ]
+    return size, assignments
+
+
+def _create_experiment_record(
+    conditions: list[str],
+    subject_ids: list[str],
+    seed: int,
+    washout_seconds: int,
+) -> dict:
+    """校验输入、重新生成 Williams 分配并持久化为独立实验，返回名册响应。
+
+    每次调用都生成新的实验 ID、新的稳定槽位与新的 nonce / 盲态承诺，
+    不接受任何外部传入的槽位、nonce 或进度，因此创建与克隆路径都不会
+    复用既有实验的盲态材料或揭盲状态。
+    """
+    size, assignments = _build_assignments(conditions, subject_ids, seed)
 
     experiment_id = uuid.uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
     db.insert_experiment(
         experiment_id,
         conditions,
-        payload.seed,
+        seed,
         size,
         created_at,
         assignments,
-        washout_seconds=payload.washout_seconds,
+        washout_seconds=washout_seconds,
     )
 
     return {
         "experiment_id": experiment_id,
         "conditions": conditions,
-        "seed": payload.seed,
+        "seed": seed,
         "group_size": size,
-        "num_subjects": count,
-        "num_periods": n,
-        "washout_seconds": payload.washout_seconds,
+        "num_subjects": len(subject_ids),
+        "num_periods": len(conditions),
+        "washout_seconds": washout_seconds,
         "status": "active",
         "state_version": 0,
         "created_at": created_at,
         "assignments": [{"subject_id": s} for s in subject_ids],
     }
+
+
+@app.post(
+    "/experiments",
+    status_code=201,
+    response_model=ExperimentOut,
+    summary="创建实验并生成分配结果（不返回条件序列）",
+)
+def create_experiment(payload: ExperimentCreate) -> dict:
+    conditions = payload.conditions
+    subject_ids = payload.subject_ids
+
+    _validate_conditions(conditions)
+    _validate_subject_ids(subject_ids)
+    _ensure_complete_groups(len(subject_ids), group_size(len(conditions)))
+
+    return _create_experiment_record(
+        conditions, subject_ids, payload.seed, payload.washout_seconds
+    )
+
+
+@app.post(
+    "/experiments/{experiment_id}/clone",
+    status_code=201,
+    response_model=ExperimentOut,
+    summary=(
+        "基于源实验条件克隆独立实验：重新生成 Williams 分配、稳定槽位与"
+        "每周期盲态承诺，不复用源实验的 nonce / commitment 或揭盲进度"
+    ),
+)
+def clone_experiment(experiment_id: str, payload: ExperimentClone) -> dict:
+    source = db.get_experiment(experiment_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+
+    subject_ids = payload.subject_ids
+    _validate_subject_ids(subject_ids)
+    conditions = source["conditions"]
+    _ensure_complete_groups(len(subject_ids), group_size(len(conditions)))
+
+    # washout_seconds 省略时沿用源实验；条件同样继承自源实验。
+    # 其余一切（ID、分配、槽位、nonce / commitment、状态与进度）均重新生成。
+    washout_seconds = (
+        payload.washout_seconds
+        if payload.washout_seconds is not None
+        else source["washout_seconds"]
+    )
+
+    return _create_experiment_record(
+        conditions, subject_ids, payload.seed, washout_seconds
+    )
 
 
 @app.get(
