@@ -16,6 +16,10 @@
 另提供受试者换号：仅允许原受试者从未揭盲时，在单个写事务内把隐藏分配
 （序列内容与下标不变）与进度原子转移到新编号，原编号保留墓碑不可复用、
 不可查询或推进，并追加不含条件内容的换号审计（按时间倒序分页查询）。
+另提供实验模板克隆：POST /experiments/{id}/clone 基于源实验条件创建独立
+新实验，接收新的互异 subject_ids、seed 与可选 washout_seconds；克隆会
+重新生成 Williams 分配、稳定槽位与每周期盲态承诺，绝不复用源实验的
+nonce/commitment，也不复制任何揭盲 / 完成 / 紧急揭盲进度与状态。
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from .schemas import (
     EmergencyUnblindEventsOut,
     EmergencyUnblindOut,
     EmergencyUnblindRequest,
+    ExperimentClone,
     ExperimentCreate,
     ExperimentOut,
     ExperimentSummary,
@@ -68,7 +73,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -98,64 +103,69 @@ def _state_conflict_detail(exc: db.InvalidStateTransitionError) -> dict:
     return detail
 
 
-@app.post(
-    "/experiments",
-    status_code=201,
-    response_model=ExperimentOut,
-    summary="创建实验并生成分配结果（不返回条件序列）",
-)
-def create_experiment(payload: ExperimentCreate) -> dict:
-    conditions = payload.conditions
-    subject_ids = payload.subject_ids
-
+def _validate_conditions(conditions: list[str]) -> None:
+    """校验条件列表：非空字符串且互异。"""
     if any(not c.strip() for c in conditions):
-        raise HTTPException(
-            status_code=422, detail="conditions 不能为空字符串"
-        )
+        raise HTTPException(status_code=422, detail="conditions 不能为空字符串")
     if len(set(conditions)) != len(conditions):
         raise HTTPException(
             status_code=422, detail="conditions 必须互异（存在重复条件）"
         )
+
+
+def _validate_subject_ids(subject_ids: list[str]) -> None:
+    """校验受试者列表：非空字符串且互异。"""
     if any(not s.strip() for s in subject_ids):
-        raise HTTPException(
-            status_code=422, detail="subject_ids 不能为空字符串"
-        )
+        raise HTTPException(status_code=422, detail="subject_ids 不能为空字符串")
     if len(set(subject_ids)) != len(subject_ids):
         raise HTTPException(
             status_code=422, detail="subject_ids 必须互异（存在重复受试者）"
         )
 
+
+def _validate_full_groups(count: int, size: int) -> None:
+    """受试者数量必须能整分为完整的 Williams 序列组。"""
+    if count % size == 0:
+        return
+    lower = (count // size) * size
+    upper = lower + size
+    nearest = [lower, upper] if lower > 0 else [upper]
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "message": (
+                f"受试者数量 {count} 无法整分为完整的序列组"
+                f"（每组 {size} 条序列）"
+            ),
+            "subject_count": count,
+            "group_size": size,
+            "nearest_acceptable": nearest,
+        },
+    )
+
+
+def _build_assignments(
+    conditions: list[str], subject_ids: list[str], seed: int
+) -> tuple[int, list[dict]]:
+    """按种子确定性地生成 Williams 分配。
+
+    Williams 平衡序列（下标形式）映射为实际条件后，用种子打乱“序列池”
+    再依次分配给受试者；池中每条序列恰好出现 ``count // size`` 次，
+    保证整组完整。完整序列只写入服务端存储，不进入响应。
+
+    :returns: ``(完整序列组大小, 分配列表)``。
+    """
     n = len(conditions)
     size = group_size(n)
     count = len(subject_ids)
+    _validate_full_groups(count, size)
 
-    if count % size != 0:
-        lower = (count // size) * size
-        upper = lower + size
-        nearest = [lower, upper] if lower > 0 else [upper]
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": (
-                    f"受试者数量 {count} 无法整分为完整的序列组"
-                    f"（每组 {size} 条序列）"
-                ),
-                "subject_count": count,
-                "group_size": size,
-                "nearest_acceptable": nearest,
-            },
-        )
-
-    # Williams 平衡序列（下标形式），再映射为实际条件。
-    # 完整序列写入服务端存储，不在响应中返回。
     index_sequences = williams_sequences(n)
     condition_sequences = [
         [conditions[i] for i in seq] for seq in index_sequences
     ]
 
-    # 用种子确定性地打乱“序列池”，再依次分配给受试者。
-    # 池中每条序列恰好出现 count // size 次，保证整组完整。
-    rng = random.Random(payload.seed)
+    rng = random.Random(seed)
     pool = list(range(size)) * (count // size)
     rng.shuffle(pool)
 
@@ -167,6 +177,22 @@ def create_experiment(payload: ExperimentCreate) -> dict:
         }
         for i, subject_id in enumerate(subject_ids)
     ]
+    return size, assignments
+
+
+@app.post(
+    "/experiments",
+    status_code=201,
+    response_model=ExperimentOut,
+    summary="创建实验并生成分配结果（不返回条件序列）",
+)
+def create_experiment(payload: ExperimentCreate) -> dict:
+    conditions = payload.conditions
+    subject_ids = payload.subject_ids
+    _validate_conditions(conditions)
+    _validate_subject_ids(subject_ids)
+
+    size, assignments = _build_assignments(conditions, subject_ids, payload.seed)
 
     experiment_id = uuid.uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
@@ -185,9 +211,66 @@ def create_experiment(payload: ExperimentCreate) -> dict:
         "conditions": conditions,
         "seed": payload.seed,
         "group_size": size,
-        "num_subjects": count,
-        "num_periods": n,
+        "num_subjects": len(subject_ids),
+        "num_periods": len(conditions),
         "washout_seconds": payload.washout_seconds,
+        "status": "active",
+        "state_version": 0,
+        "created_at": created_at,
+        "assignments": [{"subject_id": s} for s in subject_ids],
+    }
+
+
+@app.post(
+    "/experiments/{experiment_id}/clone",
+    status_code=201,
+    response_model=ExperimentOut,
+    summary=(
+        "基于源实验条件模板克隆独立新实验：重新生成 Williams 分配、稳定槽位"
+        "与每周期盲态承诺，不复用源实验的 nonce/commitment 或任何揭盲进度"
+    ),
+)
+def clone_experiment(experiment_id: str, payload: ExperimentClone) -> dict:
+    source = db.get_experiment(experiment_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+
+    conditions = source["conditions"]
+    subject_ids = payload.subject_ids
+    _validate_subject_ids(subject_ids)
+
+    # 用新种子重新执行 Williams 池打乱；受试者数量不成整组时返回明确错误
+    size, assignments = _build_assignments(conditions, subject_ids, payload.seed)
+
+    # 省略 washout_seconds 时沿用源实验洗脱期；显式传值（含 0）时以请求为准
+    washout_seconds = (
+        source["washout_seconds"]
+        if payload.washout_seconds is None
+        else payload.washout_seconds
+    )
+
+    # 新实验 ID、创建时间、稳定槽位与 128 位 nonce/承诺全部重新生成，
+    # 源实验的揭盲 / 完成 / 暂停 / 紧急揭盲 / 快照等任何状态均不复制。
+    new_experiment_id = uuid.uuid4().hex
+    created_at = datetime.now(timezone.utc).isoformat()
+    db.insert_experiment(
+        new_experiment_id,
+        conditions,
+        payload.seed,
+        size,
+        created_at,
+        assignments,
+        washout_seconds=washout_seconds,
+    )
+
+    return {
+        "experiment_id": new_experiment_id,
+        "conditions": conditions,
+        "seed": payload.seed,
+        "group_size": size,
+        "num_subjects": len(subject_ids),
+        "num_periods": len(conditions),
+        "washout_seconds": washout_seconds,
         "status": "active",
         "state_version": 0,
         "created_at": created_at,
